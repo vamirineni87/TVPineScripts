@@ -1,0 +1,403 @@
+//@version=6
+indicator("EMA Crossover", overlay=true, max_bars_back=500)
+
+//==============================
+// Inputs
+//==============================
+fastLen        = input.int(5,   "Fast", minval=1, inline="ema")
+slowLen        = input.int(15,   "Slow", minval=2, inline="ema")
+srcChoice      = input.source(close, "EMA Source", inline="ema")
+
+useAnchor      = input.bool(true,  "Use Anchor", inline="anch")
+anchorLen      = input.int(30,      "Len1", minval=1, inline="anch")
+useAnchor2     = input.bool(false,   "Use 2nd", inline="anch2")
+anchor2Len     = input.int(30,      "Len2", minval=1, inline="anch2")
+anchorStartHour = input.int(10,    "Start Hour", minval=0, maxval=23, inline="anch2")
+
+
+useRSISlope    = input.bool(true,  "RSI Slope", inline="rsi")
+rsiLen         = input.int(15,     "Len", minval=1, inline="rsi")
+rsiSlopeLen    = input.int(5,      "Lookback", minval=1, inline="rsi")
+
+atrLen         = input.int(14,     "ATR Len", minval=1, inline="vol")
+adxLen         = input.int(14,     "ADX Len", minval=1, inline="vol")
+
+useATRFilter   = input.bool(false, "Min ATR", inline="atrfilt")
+minATR         = input.float(0.30, "Val", minval=0.0, step=0.05, inline="atrfilt")
+
+useADXFilter   = input.bool(true, "Min ADX", inline="adxfilt")
+minADX         = input.float(40.0, "Val", minval=0.0, step=5.0, inline="adxfilt")
+
+requireVWAP    = input.bool(true,  "VWAP Confirm", inline="vwap")
+allowNearTouch = input.bool(true,  "Near-touch", inline="vwap")
+vwapProxPct    = input.float(2, "Prox%", minval=0.0, step=0.05, inline="vwap")
+
+lookbackBars   = input.int(20,     "Pullback Lookback", minval=1, inline="timing")
+cooldownBars   = input.int(15,      "Cooldown", minval=0, inline="timing")
+
+requireCrossDistFilter = input.bool(true, "Min Move from Cross", inline="xdist")
+crossDistPctMode = input.bool(true, "Use %", inline="xdist")
+minCrossDistPct = input.float(0.1, "Val", minval=0.0, maxval=2.0, step=0.005, inline="xdist")
+
+requireSignalDistFilter = input.bool(false, "Min Move from Last Signal", inline="sigdist")
+signalDistPctMode = input.bool(true, "Use %", inline="sigdist")
+minSignalDistPct = input.float(0.5, "Val", minval=0.0, maxval=10.0, step=0.1, inline="sigdist")
+
+sessionWin     = input.session("0935-1530", "Session", inline="win")
+restrictToWin  = input.bool(true,  "Restrict", inline="win")
+showOverlay    = input.bool(true,  "Show Counts", inline="win")
+
+limitSessions  = input.bool(true,  "Limit Data", inline="lim")
+maxSessionDays = input.int(5,      "Max Days", minval=1, maxval=10, inline="lim")
+
+//==============================
+// Data (no repaint)
+//==============================
+sym = syminfo.tickerid
+
+// Detect if we're in recent sessions to limit calculations (optional)
+var int sessionCount = 0
+var bool isRecentSession = false
+
+// Count sessions and check if we're in recent sessions
+if ta.change(dayofmonth) != 0 or barstate.isfirst
+    sessionCount += 1
+
+// Calculate days back from current time
+daysBack = (timenow - time) / 86400000  // Convert milliseconds to days
+
+// Check if we're in recent sessions based on user setting
+isRecentSession := not limitSessions or (daysBack <= maxSessionDays)
+
+// Only calculate data for recent sessions to improve performance
+var float emaFast = na
+var float emaSlow = na
+var float close1m = na
+var float high1m = na
+var float low1m = na
+
+if isRecentSession
+    // Request all 1-minute data
+    emaFast := request.security(sym, "1", ta.ema(srcChoice, fastLen), barmerge.gaps_off, barmerge.lookahead_off)
+    emaSlow := request.security(sym, "1", ta.ema(srcChoice, slowLen), barmerge.gaps_off, barmerge.lookahead_off)
+    close1m := request.security(sym, "1", close, barmerge.gaps_off, barmerge.lookahead_off)
+    high1m := request.security(sym, "1", high, barmerge.gaps_off, barmerge.lookahead_off)
+    low1m := request.security(sym, "1", low, barmerge.gaps_off, barmerge.lookahead_off)
+
+// Initialize VWAP variables
+var float vwap1 = na
+var float vwapDev = na
+var float vwapUpper1 = na
+var float vwapLower1 = na
+var float vwapUpper2 = na
+var float vwapLower2 = na
+var float rsi1m = na
+
+// Initialize ATR and ADX variables (for display only)
+var float atr1m = na
+var float adx1m = na
+
+if isRecentSession
+    // VWAP and bands calculation - using 390-bar stdev (approx 6.5hr session on 1min chart)
+    [vwap1Temp, vwapDevTemp] = request.security(sym, "1", [ta.vwap(hlc3), ta.stdev(hlc3, 390)], barmerge.gaps_off, barmerge.lookahead_off)
+    vwap1 := vwap1Temp
+    vwapDev := vwapDevTemp
+
+    // Calculate bands
+    vwapUpper1 := vwap1 + vwapDev
+    vwapLower1 := vwap1 - vwapDev
+    vwapUpper2 := vwap1 + 2 * vwapDev
+    vwapLower2 := vwap1 - 2 * vwapDev
+
+    // RSI calculation (single period only)
+    rsi1m := request.security(sym, "1", ta.rsi(close, rsiLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+    // ATR calculation (for display only - no filtering yet)
+    atr1m := request.security(sym, "1", ta.atr(atrLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+    // ADX calculation (manual - ta.adx doesn't exist in Pine v6)
+    [diPlus, diMinus, adxTemp] = request.security(sym, "1", ta.dmi(adxLen, adxLen), barmerge.gaps_off, barmerge.lookahead_off)
+    adx1m := adxTemp
+
+// Session window (09:35–15:30, exchange time)
+inWindow1m    = restrictToWin ? not na(time("1", sessionWin)) : true
+enteredWindow = inWindow1m and not inWindow1m[1]
+exitedWindow  = not inWindow1m and inWindow1m[1]
+
+// Simplified new session detection
+isNewSession = ta.change(dayofmonth) != 0
+
+// 1m anchor (two EMAs)
+var float anchorEMA = na
+var float anchor2EMA = na
+var bool anchUp = false
+var bool anchDown = false
+
+if isRecentSession
+    anchorEMA := request.security(sym, "1", ta.ema(close, anchorLen), barmerge.gaps_off, barmerge.lookahead_off)
+    anchor2EMA := request.security(sym, "1", ta.ema(close, anchor2Len), barmerge.gaps_off, barmerge.lookahead_off)
+
+    // Anchor conditions - both anchors must align (if 2nd anchor enabled)
+    anch1Up = close1m > anchorEMA and anchorEMA > anchorEMA[1]
+    anch1Down = close1m < anchorEMA and anchorEMA < anchorEMA[1]
+    // 2nd anchor only checks slope direction (rising for long, falling for short)
+    anch2Up = not useAnchor2 or (anchor2EMA > anchor2EMA[1])
+    anch2Down = not useAnchor2 or (anchor2EMA < anchor2EMA[1])
+
+    anchUp := anch1Up and anch2Up
+    anchDown := anch1Down and anch2Down
+
+// Anchor filter - only apply from configured start hour onwards
+isAfterAnchorStart = hour >= anchorStartHour
+bullOK = not useAnchor or (not isAfterAnchorStart) or anchUp
+bearOK = not useAnchor or (not isAfterAnchorStart) or anchDown
+
+//==============================
+// Triggers (gated to session window)
+//==============================
+// Better pullback detection: check if we had a bullish trend, then a small dip, then recovery
+// For longs: EMAs were bullish aligned, had a brief dip, now crossing back up
+wasBullish = ta.highest(emaFast - emaSlow, lookbackBars) > 0  // Had bullish alignment in lookback
+hadDip = ta.lowest(emaFast - emaSlow, math.min(5, lookbackBars/2)) < 0  // Had a recent shallow dip
+recentBullDip = wasBullish and hadDip  // Combines both conditions
+
+// For shorts: EMAs were bearish aligned, had a brief pop, now crossing back down
+wasBearish = ta.lowest(emaFast - emaSlow, lookbackBars) < 0  // Had bearish alignment in lookback
+hadPop = ta.highest(emaFast - emaSlow, math.min(5, lookbackBars/2)) > 0  // Had a recent shallow pop
+recentBearPop = wasBearish and hadPop  // Combines both conditions
+
+crossUp        = ta.crossover(emaFast, emaSlow)
+crossDown      = ta.crossunder(emaFast, emaSlow)
+
+// Simplified VWAP confirmation
+vwapNear = allowNearTouch ? math.abs(close1m - vwap1) <= math.abs(vwap1) * vwapProxPct * 0.01 : false
+vwapOKLong  = not requireVWAP or ta.crossover(close1m, vwap1) or (low1m <= vwap1 and close1m > vwap1) or vwapNear
+vwapOKShort = not requireVWAP or ta.crossunder(close1m, vwap1) or (high1m >= vwap1 and close1m < vwap1) or vwapNear
+
+// RSI Slope confirmation
+rsi1Slope = (rsi1m - rsi1m[rsiSlopeLen]) / rsiSlopeLen
+
+// RSI slope conditions
+rsiSlopeLong = rsi1Slope > 0
+rsiSlopeShort = rsi1Slope < 0
+rsiOKLong = not useRSISlope or rsiSlopeLong
+rsiOKShort = not useRSISlope or rsiSlopeShort
+
+// ATR and ADX filters
+atrOK = not useATRFilter or (not na(atr1m) and atr1m >= minATR)
+adxOK = not useADXFilter or (not na(adx1m) and adx1m >= minADX)
+
+// Track last crossover price for distance filter
+var float lastCrossPrice = na
+
+// Check distance from last crossover
+crossDist = isRecentSession and not na(lastCrossPrice) and not na(close1m) ? math.abs(close1m - lastCrossPrice) : 0.0
+
+crossDistValue = crossDistPctMode ? (lastCrossPrice > 0 ? (crossDist / lastCrossPrice) * 100 : 0) : crossDist
+
+crossDistOK = (not na(lastCrossPrice) and isRecentSession) ? (not requireCrossDistFilter or crossDistValue >= minCrossDistPct) : true
+
+// Track last signal price for signal distance filter
+var float lastSignalPrice = na
+
+// Check distance from last signal
+signalDist = isRecentSession and not na(lastSignalPrice) and not na(close1m) ? math.abs(close1m - lastSignalPrice) : 0.0
+
+signalDistValue = signalDistPctMode ? (lastSignalPrice > 0 ? (signalDist / lastSignalPrice) * 100 : 0) : signalDist
+
+signalDistOK = (not na(lastSignalPrice) and isRecentSession) ? (not requireSignalDistFilter or signalDistValue >= minSignalDistPct) : true
+
+// Raw signals (bar close) — strictly inside window and current session only
+rawLong  = isRecentSession and barstate.isconfirmed and inWindow1m and bullOK and recentBullDip  and crossUp   and vwapOKLong and rsiOKLong and not isNewSession[1] and crossDistOK and signalDistOK and atrOK and adxOK
+rawShort = isRecentSession and barstate.isconfirmed and inWindow1m and bearOK and recentBearPop  and crossDown and vwapOKShort and rsiOKShort and not isNewSession[1] and crossDistOK and signalDistOK and atrOK and adxOK
+
+// Update last cross price only when signal is actually allowed (after all checks)
+if isRecentSession and ((rawLong and crossUp) or (rawShort and crossDown))
+    lastCrossPrice := close1m
+
+// Debounce + flip with pending long logic
+var int lastSignalBar = na  // Track last signal of ANY type (long or short)
+var int posState = 0   // +1 = long, -1 = short, 0 = flat
+var bool pendingLong = false  // Track if long was blocked by cooldown
+
+// Longs need cooldown after ANY signal (long or short)
+signalCooldownMet = na(lastSignalBar) or (bar_index - lastSignalBar >= cooldownBars)
+
+// Check if we blocked a long due to cooldown
+if rawLong and not signalCooldownMet and posState != +1
+    pendingLong := true
+
+// Long signals:
+// 1. Normal long with cooldown met after ANY previous signal
+// 2. Pending long released when cooldown met AND price still trending up (EMA fast > slow)
+normalLong = rawLong and signalCooldownMet and posState != +1
+releasedPendingLong = pendingLong and signalCooldownMet and (emaFast > emaSlow) and posState != +1 and inWindow1m
+
+longReady = normalLong or releasedPendingLong
+shortReady = rawShort and posState != -1  // No cooldown for shorts - immediate execution
+
+if longReady
+    lastSignalBar := bar_index  // Track this signal for cooldown
+    posState := +1
+    pendingLong := false  // Clear pending flag
+    lastSignalPrice := close1m  // Track signal price for distance filter
+
+if shortReady
+    lastSignalBar := bar_index  // Track this signal for cooldown
+    posState := -1
+    pendingLong := false  // Clear pending if we go short
+    lastSignalPrice := close1m  // Track signal price for distance filter
+
+// Reset at session start
+if (enteredWindow or isNewSession) and isRecentSession
+    posState := 0
+    lastSignalBar := na
+    lastCrossPrice := na
+    lastSignalPrice := na
+    pendingLong := false
+
+//==============================
+// Session counters
+//==============================
+var int longCount  = 0
+var int shortCount = 0
+
+if (enteredWindow or isNewSession) and isRecentSession
+    longCount := 0
+    shortCount := 0
+
+if longReady and isRecentSession
+    longCount += 1
+
+if shortReady and isRecentSession
+    shortCount += 1
+
+//==============================
+// Plots / markers
+//==============================
+plot(emaSlow, "EMA(5) 1m", color=color.new(color.orange, 0), linewidth=2)
+plot(emaFast, "EMA(3) 1m", color=color.new(color.white, 0), linewidth=2)
+plot(vwap1,   "VWAP (1m)", color=color.new(color.blue, 0), linewidth=2)
+
+// Plot VWAP bands
+plot(vwapUpper1, "VWAP Upper 1σ", color=color.new(color.blue, 70), linewidth=1, style=plot.style_line)
+plot(vwapLower1, "VWAP Lower 1σ", color=color.new(color.blue, 70), linewidth=1, style=plot.style_line)
+plot(vwapUpper2, "VWAP Upper 2σ", color=color.new(color.blue, 70), linewidth=1, style=plot.style_linebr)
+plot(vwapLower2, "VWAP Lower 2σ", color=color.new(color.blue, 70), linewidth=1, style=plot.style_linebr)
+
+// Fill between VWAP bands
+fill(plot(vwapUpper2, display=display.none), plot(vwapUpper1, display=display.none), color=color.new(color.blue, 99))
+fill(plot(vwapLower1, display=display.none), plot(vwapLower2, display=display.none), color=color.new(color.blue, 99))
+fill(plot(vwapUpper1, display=display.none), plot(vwap1, display=display.none), color=color.new(color.blue, 99))
+fill(plot(vwap1, display=display.none), plot(vwapLower1, display=display.none), color=color.new(color.blue, 99))
+
+// Plot anchor EMAs
+plot(anchorEMA, "Anchor EMA(10) 1m", color=color.new(color.purple, 0), linewidth=2)
+plot(useAnchor2 ? anchor2EMA : na, "Anchor 2 EMA(30) 1m", color=color.new(color.fuchsia, 0), linewidth=2)
+
+// Plot ATR and ADX for analysis (display only)
+plot(atr1m, title="ATR 1m", color=color.new(color.yellow, 0), linewidth=1, display=display.data_window)
+plot(adx1m, title="ADX 1m", color=color.new(color.aqua, 0), linewidth=1, display=display.data_window)
+
+// Session background
+bgcolor(inWindow1m ? na : color.new(color.black, 94))
+
+// Signal markers
+plotshape(longReady,  title="LONG Signal",  location=location.belowbar, style=shape.triangleup,   size=size.tiny, color=color.new(color.green, 0), text="LONG",  textcolor=color.white)
+plotshape(shortReady, title="SHORT Signal", location=location.abovebar, style=shape.triangledown, size=size.tiny, color=color.new(color.red,   0), text="SHORT", textcolor=color.white)
+
+//==============================
+// Pine Logs - Trace Debugging
+//==============================
+if barstate.isconfirmed and inWindow1m and isRecentSession
+    // Log on every cross (potential signal)
+    if crossUp or crossDown
+        logMsg = "=== " + (crossUp ? "CROSS UP" : "CROSS DOWN") + " DETECTED ===\n" +
+                 "Time: " + str.format("{0,time,HH:mm}", time) + " | Price: $" + str.tostring(close1m, "#.##") + "\n" +
+                 "--- EMAs ---\n" +
+                 "  Fast EMA: $" + str.tostring(emaFast, "#.##") + " | Slow EMA: $" + str.tostring(emaSlow, "#.##") + "\n" +
+                 "  EMA Diff: $" + str.tostring(emaFast - emaSlow, "#.##") + "\n" +
+                 "--- Anchors ---\n" +
+                 "  Anchor(10): $" + str.tostring(anchorEMA, "#.##") + " | Anchor(30): $" + str.tostring(anchor2EMA, "#.##") + "\n" +
+                 "  bullOK: " + str.tostring(bullOK) + " | bearOK: " + str.tostring(bearOK) + "\n" +
+                 "  After Anchor Start: " + str.tostring(isAfterAnchorStart) + "\n" +
+                 "--- VWAP ---\n" +
+                 "  VWAP: $" + str.tostring(vwap1, "#.##") + " | Dist: $" + str.tostring(close1m - vwap1, "#.##") + "\n" +
+                 "  vwapOKLong: " + str.tostring(vwapOKLong) + " | vwapOKShort: " + str.tostring(vwapOKShort) + "\n" +
+                 "--- RSI ---\n" +
+                 "  RSI: " + str.tostring(rsi1m, "#.##") + " | Slope: " + str.tostring(rsi1Slope, "#.##") + "\n" +
+                 "  rsiOKLong: " + str.tostring(rsiOKLong) + " | rsiOKShort: " + str.tostring(rsiOKShort) + "\n" +
+                 "--- Volatility/Trend ---\n" +
+                 "  ATR: $" + str.tostring(atr1m, "#.##") + " | atrOK: " + str.tostring(atrOK) + " (min: $" + str.tostring(minATR, "#.##") + ")\n" +
+                 "  ADX: " + str.tostring(adx1m, "#.##") + " | adxOK: " + str.tostring(adxOK) + " (min: " + str.tostring(minADX, "#.##") + ")\n" +
+                 "--- Pullback ---\n" +
+                 "  recentBullDip: " + str.tostring(recentBullDip) + " | recentBearPop: " + str.tostring(recentBearPop) + "\n" +
+                 "--- Cross Distance ---\n" +
+                 "  Last Cross: $" + str.tostring(lastCrossPrice, "#.##") + " | Distance: " + str.tostring(crossDistValue, "#.##") + (crossDistPctMode ? "%" : "$") + "\n" +
+                 "  crossDistOK: " + str.tostring(crossDistOK) + " (min: " + str.tostring(minCrossDistPct, "#.###") + ")\n" +
+                 "--- Signal Distance ---\n" +
+                 "  Last Signal: $" + str.tostring(lastSignalPrice, "#.##") + " | Distance: " + str.tostring(signalDistValue, "#.##") + (signalDistPctMode ? "%" : "$") + "\n" +
+                 "  signalDistOK: " + str.tostring(signalDistOK) + " (min: " + str.tostring(minSignalDistPct, "#.###") + ")\n" +
+                 "--- Cooldown/State ---\n" +
+                 "  Position: " + (posState == +1 ? "LONG" : posState == -1 ? "SHORT" : "FLAT") + "\n" +
+                 "  Last Signal Bar: " + str.tostring(lastSignalBar) + " | Bars Ago: " + str.tostring(na(lastSignalBar) ? 0 : bar_index - lastSignalBar) + "\n" +
+                 "  Cooldown Met: " + str.tostring(signalCooldownMet) + " | Pending Long: " + str.tostring(pendingLong) + "\n" +
+                 "--- Raw Signals ---\n" +
+                 "  rawLong: " + str.tostring(rawLong) + " | rawShort: " + str.tostring(rawShort) + "\n" +
+                 "--- Final Signals ---\n" +
+                 "  longReady: " + str.tostring(longReady) + " | shortReady: " + str.tostring(shortReady)
+
+        log.info(logMsg)
+
+    // Log when signal fires
+    if longReady
+        log.warning(">>> LONG SIGNAL EXECUTED <<<\n" +
+                   "Entry Price: $" + str.tostring(close1m, "#.##") + "\n" +
+                   "Time: " + str.format("{0,time,HH:mm}", time) + "\n" +
+                   "Type: " + (normalLong ? "Normal Long" : "Released Pending Long") + "\n" +
+                   "Session Count: " + str.tostring(longCount + 1))
+
+    if shortReady
+        log.error(">>> SHORT SIGNAL EXECUTED <<<\n" +
+                 "Entry Price: $" + str.tostring(close1m, "#.##") + "\n" +
+                 "Time: " + str.format("{0,time,HH:mm}", time) + "\n" +
+                 "Type: Normal Short\n" +
+                 "Session Count: " + str.tostring(shortCount + 1))
+
+// Alerts with placeholder message (customize in TradingView alert dialog using {{close}}, {{ticker}}, etc.)
+alertcondition(longReady,  title="EMA Momentum LONG",  message='{"action":"LONG","symbol":"{{ticker}}","time":"{{timenow}}","price":{{close}},"interval":"{{interval}}"}')
+alertcondition(shortReady, title="EMA Momentum SHORT", message='{"action":"SHORT","symbol":"{{ticker}}","time":"{{timenow}}","price":{{close}},"interval":"{{interval}}"}')
+
+//==============================
+// Signal Count Overlay
+//==============================
+// Helper function for debug colors
+checkColor(val) => val ? color.green : color.red
+
+var table sigCountTbl = table.new(position.bottom_right, 1, 18, frame_color=color.new(color.black, 0), border_width=1)
+if showOverlay
+    posText = posState == +1 ? "LONG" : posState == -1 ? "SHORT" : "FLAT"
+    posColor = posState == +1 ? color.green : posState == -1 ? color.red : color.gray
+
+    // Anchor trend state
+    anchorTrend = anchUp ? "↗️ UP" : anchDown ? "↘️ DOWN" : "→ FLAT"
+    anchorColor = anchUp ? color.green : anchDown ? color.red : color.gray
+
+    table.cell(sigCountTbl, 0, 0, "Session 09:35–15:30", text_color=color.white, bgcolor=color.new(color.black, 0), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 1, "Position: " + posText, text_color=posColor, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 2, "Longs: " + str.tostring(longCount) + " | Shorts: " + str.tostring(shortCount), text_color=color.white, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 3, "━━━ DEBUG ━━━", text_color=color.yellow, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 4, "crossUp: " + str.tostring(crossUp), text_color=checkColor(crossUp), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 5, "bullOK: " + str.tostring(bullOK), text_color=checkColor(bullOK), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 6, "recentBullDip: " + str.tostring(recentBullDip), text_color=checkColor(recentBullDip), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 7, "vwapOKLong: " + str.tostring(vwapOKLong), text_color=checkColor(vwapOKLong), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 8, "rsiOKLong: " + str.tostring(rsiOKLong), text_color=checkColor(rsiOKLong), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 9, "crossDistOK: " + str.tostring(crossDistOK), text_color=checkColor(crossDistOK), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 10, "signalDistOK: " + str.tostring(signalDistOK), text_color=checkColor(signalDistOK), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 11, "inWindow: " + str.tostring(inWindow1m), text_color=checkColor(inWindow1m), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 12, "isRecentSession: " + str.tostring(isRecentSession), text_color=checkColor(isRecentSession), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 13, "Anchor: " + anchorTrend, text_color=anchorColor, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 14, "ATR(" + str.tostring(atrLen) + "): " + str.tostring(atr1m, "#.##"), text_color=color.yellow, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 15, "ADX(" + str.tostring(adxLen) + "): " + str.tostring(adx1m, "#.##"), text_color=color.aqua, text_size=size.auto)
+    table.cell(sigCountTbl, 0, 16, "atrOK: " + str.tostring(atrOK), text_color=checkColor(atrOK), text_size=size.auto)
+    table.cell(sigCountTbl, 0, 17, "adxOK: " + str.tostring(adxOK), text_color=checkColor(adxOK), text_size=size.auto)
