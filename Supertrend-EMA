@@ -1,0 +1,733 @@
+//@version=6
+indicator("Supertrend-EMA", overlay=true, format=format.price, precision=2)
+
+//==============================
+// INPUTS
+//==============================
+
+// Supertrend Inputs
+atrPeriod    = input.int(1, title="ATR Period", group="Supertrend", inline="atr")
+multiplier   = input.float(5.0, title="Multiplier", step=0.1, group="Supertrend", inline="atr")
+src          = input.source(close, title="Source", group="Supertrend", inline="src")
+changeATR    = input.bool(true, title="Change ATR Method?", group="Supertrend", inline="src")
+highlighting = input.bool(true, title="Highlighting", group="Supertrend", inline="display")
+
+// EMA Inputs
+fastLen = input.int(3, "Fast EMA", minval=1, group="EMA Crossover", inline="ema")
+slowLen = input.int(5, "Slow EMA", minval=1, group="EMA Crossover", inline="ema")
+
+// Signal Options
+showSupertrendSignals = input.bool(false, "Show Supertrend Signals", group="Display", inline="signals")
+showFilteredSignals   = input.bool(true, "Show Filtered Signals", group="Display", inline="signals")
+showDebugTable        = input.bool(true, "Show Signal Counts", group="Display", inline="debug")
+showStateTable        = input.bool(true, "Show State Debug", group="Display", inline="debug2")
+
+// Hold Signal Settings
+enableHold  = input.bool(true, "Hold Signal", group="Signal Hold", inline="hold")
+maxHoldBars = input.int(10, "Max Bars", minval=1, maxval=50, group="Signal Hold", inline="hold")
+
+// Session Window Settings
+enableSession = input.bool(true, "Enable Session Filter", group="Session Window", inline="session_enable")
+sessionStart  = input.session("0930-1600", "Session Time", group="Session Window", inline="session_time")
+
+// DI Filter Settings
+enableDiFilter = input.bool(true, "Enable DI Filter", group="DI Filter", inline="di_enable")
+adxLength      = input.int(5, "DI Period", minval=1, group="DI Filter", inline="di_period")
+diLookback     = input.int(3, "DI Lookback Bars", minval=1, maxval=10, group="DI Filter", inline="di_lookback")
+
+//==============================
+// SUPERTREND CALCULATION
+//==============================
+
+// Calculate ATR
+atr2 = ta.sma(ta.tr, atrPeriod)
+atr  = changeATR ? ta.atr(atrPeriod) : atr2
+
+// Calculate Supertrend Bands
+up = src - (multiplier * atr)
+up1 = nz(up[1], up)
+up := close[1] > up1 ? math.max(up, up1) : up
+
+dn = src + (multiplier * atr)
+dn1 = nz(dn[1], dn)
+dn := close[1] < dn1 ? math.min(dn, dn1) : dn
+
+// Determine Trend
+trend = 1
+trend := nz(trend[1], trend)
+trend := trend == -1 and close > dn1 ? 1 : trend == 1 and close < up1 ? -1 : trend
+
+// Supertrend Signals
+supertrendBuy  = trend == 1 and trend[1] == -1
+supertrendSell = trend == -1 and trend[1] == 1
+
+//==============================
+// ADVERSE DISTANCE TRACKING
+//==============================
+
+// Calculate distance to active Supertrend band
+// For uptrend: distance = close - support (positive = above support, good)
+// For downtrend: distance = resistance - close (positive = below resistance, good for shorts)
+distanceToSupertrend = trend == 1 ? (close - up) : (dn - close)
+
+// Calculate percentage distance (normalized for different instruments)
+distancePct = (math.abs(distanceToSupertrend) / close) * 100
+
+// Track previous distance to calculate change
+var float prevDistance = na
+var float prevDistancePct = na
+
+// Calculate change metrics (positive = improving, negative = worsening)
+distanceChange = na(prevDistance) ? 0.0 : distanceToSupertrend - prevDistance
+distanceChangePct = na(prevDistancePct) ? 0.0 : distancePct - prevDistancePct
+
+// Track previous adverse distances (for when adverse signals occur)
+var float prevAdverseLongDistance = na
+var float prevAdverseShortDistance = na
+
+// Update history at bar close
+if barstate.isconfirmed
+    prevDistance := distanceToSupertrend
+    prevDistancePct := distancePct
+    // Store adverse distances when applicable
+    if trend == -1  // Store potential long adverse distance
+        prevAdverseLongDistance := close - dn
+    if trend == 1   // Store potential short adverse distance
+        prevAdverseShortDistance := up - close
+
+//==============================
+// DI CALCULATION FUNCTIONS
+//==============================
+
+calcPlusDI(len) =>
+    up = ta.change(high)
+    down = -ta.change(low)
+    plusDM = na(up) ? na : (up > down and up > 0 ? up : 0)
+    trur = ta.rma(ta.tr, len)
+    plusDI = fixnan(100 * ta.rma(plusDM, len) / trur)
+    plusDI
+
+calcMinusDI(len) =>
+    up = ta.change(high)
+    down = -ta.change(low)
+    minusDM = na(down) ? na : (down > up and down > 0 ? down : 0)
+    trur = ta.rma(ta.tr, len)
+    minusDI = fixnan(100 * ta.rma(minusDM, len) / trur)
+    minusDI
+
+//==============================
+// EMA CROSSOVER CALCULATION
+//==============================
+
+// Calculate EMAs
+emaFast = ta.ema(close, fastLen)
+emaSlow = ta.ema(close, slowLen)
+
+// EMA Crossover Signals (raw)
+emaCrossUp   = ta.crossover(emaFast, emaSlow)
+emaCrossDown = ta.crossunder(emaFast, emaSlow)
+
+//==============================
+// DI CROSSOVER DETECTION
+//==============================
+
+// Calculate DI values
+plusDI = calcPlusDI(adxLength)
+minusDI = calcMinusDI(adxLength)
+
+// Check for recent DI crossovers within lookback period
+diCrossUpRecent = false
+for i = 0 to diLookback
+    if ta.crossover(plusDI[i], minusDI[i])
+        diCrossUpRecent := true
+        break
+
+diCrossDownRecent = false
+for i = 0 to diLookback
+    if ta.crossover(minusDI[i], plusDI[i])
+        diCrossDownRecent := true
+        break
+
+// Current DI relationship
+plusDiAbove = plusDI > minusDI
+
+//==============================
+// SESSION WINDOW LOGIC
+//==============================
+
+// Check if current bar is in session
+inSession = not enableSession or not na(time(timeframe.period, sessionStart))
+
+// Detect session boundaries
+var bool wasInSession = false
+sessionStart_detected = inSession and not wasInSession
+sessionEnd_detected   = not inSession and wasInSession
+wasInSession := inSession
+
+// Track conditions at session start to prevent stale signals
+var int trendAtSessionStart = na
+var float emaFastAboveSlowAtStart = na  // Using float to allow na (1.0 = true, 0.0 = false, na = unset)
+var int lastSignalDirection = 0  // 1 = long, -1 = short, 0 = none
+
+// Store initial conditions when session starts
+if sessionStart_detected
+    trendAtSessionStart := trend
+    emaFastAboveSlowAtStart := emaFast > emaSlow ? 1.0 : 0.0
+    lastSignalDirection := 0  // Reset for new session
+
+//==============================
+// HOLD SIGNAL LOGIC
+//==============================
+
+var int pendingLongBar = na
+var int pendingShortBar = na
+
+// Clear pending signals when session ends
+if sessionEnd_detected
+    pendingLongBar := na
+    pendingShortBar := na
+
+// Clear pending on opposite cross
+if emaCrossDown
+    pendingLongBar := na
+
+if emaCrossUp
+    pendingShortBar := na
+
+// Check if DI filter confirms the signal (alternative to Supertrend)
+diLongConfirm  = enableDiFilter and diCrossUpRecent and plusDiAbove
+diShortConfirm = enableDiFilter and diCrossDownRecent and (minusDI > plusDI)
+
+// Check if conditions are immediately met (Supertrend OR DI filter confirms)
+immediateBuy  = emaCrossUp and (trend == 1 or diLongConfirm)
+immediateSell = emaCrossDown and (trend == -1 or diShortConfirm)
+
+// Store pending cross only if BOTH Supertrend AND DI filter disagree
+if enableHold and emaCrossUp and trend != 1 and not diLongConfirm
+    pendingLongBar := bar_index
+
+if enableHold and emaCrossDown and trend != -1 and not diShortConfirm
+    pendingShortBar := bar_index
+
+// Release held signals when regime changes
+var bool heldLongReleased = false
+var bool heldShortReleased = false
+
+heldLongReleased := false
+heldShortReleased := false
+
+// Check pending long - release when Supertrend flips to uptrend
+if enableHold and not na(pendingLongBar)
+    barsWaiting = bar_index - pendingLongBar
+    timeoutOK = barsWaiting <= maxHoldBars
+    regimeChanged = trend == 1 and trend[1] == -1  // Supertrend just flipped to uptrend
+
+    if timeoutOK and regimeChanged
+        heldLongReleased := true
+        pendingLongBar := na
+    else if not timeoutOK
+        // Timeout - abandon
+        pendingLongBar := na
+
+// Check pending short - release when Supertrend flips to downtrend
+if enableHold and not na(pendingShortBar)
+    barsWaiting = bar_index - pendingShortBar
+    timeoutOK = barsWaiting <= maxHoldBars
+    regimeChanged = trend == -1 and trend[1] == 1  // Supertrend just flipped to downtrend
+
+    if timeoutOK and regimeChanged
+        heldShortReleased := true
+        pendingShortBar := na
+    else if not timeoutOK
+        // Timeout - abandon
+        pendingShortBar := na
+
+//==============================
+// FIRST SIGNAL VS PRECEDING SIGNAL LOGIC
+//==============================
+
+// Check if signal represents a NEW condition change (not stale from pre-session)
+bool allowBuySignal = true
+bool allowSellSignal = true
+
+if enableSession and inSession
+    // For buy signals: Must be a fresh condition change
+    // Don't allow if conditions were already bullish at session start
+    if immediateBuy or heldLongReleased
+        // Check if this is truly NEW since session start
+        currentEmaState = emaFast > emaSlow ? 1.0 : 0.0
+        conditionsChangedSinceStart = (trend != trendAtSessionStart) or (currentEmaState != emaFastAboveSlowAtStart)
+        isFirstSignal = lastSignalDirection != 1
+
+        // Allow signal only if conditions changed OR it's a reversal from previous signal
+        allowBuySignal := conditionsChangedSinceStart or (lastSignalDirection == -1)
+
+        if allowBuySignal
+            lastSignalDirection := 1
+
+    // For sell signals: Must be a fresh condition change
+    if immediateSell or heldShortReleased
+        // Check if this is truly NEW since session start
+        currentEmaState = emaFast > emaSlow ? 1.0 : 0.0
+        conditionsChangedSinceStart = (trend != trendAtSessionStart) or (currentEmaState != emaFastAboveSlowAtStart)
+        isFirstSignal = lastSignalDirection != -1
+
+        // Allow signal only if conditions changed OR it's a reversal from previous signal
+        allowSellSignal := conditionsChangedSinceStart or (lastSignalDirection == 1)
+
+        if allowSellSignal
+            lastSignalDirection := -1
+
+//==============================
+// FINAL SIGNALS
+//==============================
+
+// Combine immediate and held signals, with session and fresh signal filters
+// Use barstate.isconfirmed to prevent repainting (signals only on closed bars, matching alert behavior)
+finalBuy  = (immediateBuy or heldLongReleased) and inSession and allowBuySignal and barstate.isconfirmed
+finalSell = (immediateSell or heldShortReleased) and inSession and allowSellSignal and barstate.isconfirmed
+
+//==============================
+// SIGNAL SOURCE AND ADVERSE TRACKING
+//==============================
+
+// Determine signal source for action_type and adverse flag
+string signalSource = ""
+bool isAdverse = false
+float adverseDistance = 0.0
+float adverseDistancePct = 0.0
+float adverseDistanceChange = 0.0
+string adverseSeverity = "none"
+
+if finalBuy
+    if immediateBuy and trend == 1
+        signalSource := "Supertrend"
+        isAdverse := false
+    else if immediateBuy and trend != 1 and diLongConfirm
+        signalSource := "DI"
+        isAdverse := true  // DI bypassed Supertrend (adverse trend)
+        // Long when trend=DOWN: measure how far below resistance
+        adverseDistance := close - dn  // Negative = below resistance (adverse)
+        adverseDistancePct := (math.abs(adverseDistance) / close) * 100
+        // Calculate change: positive = getting closer (improving), negative = getting further (worsening)
+        adverseDistanceChange := na(prevAdverseLongDistance) ? 0.0 : adverseDistance - prevAdverseLongDistance
+        // Classify severity based on percentage distance
+        adverseSeverity := adverseDistancePct < 0.5 ? "low" : adverseDistancePct < 1.0 ? "medium" : "high"
+    else if heldLongReleased
+        signalSource := "Held"
+        isAdverse := false
+
+if finalSell
+    if immediateSell and trend == -1
+        signalSource := "Supertrend"
+        isAdverse := false
+    else if immediateSell and trend != -1 and diShortConfirm
+        signalSource := "DI"
+        isAdverse := true  // DI bypassed Supertrend (adverse trend)
+        // Short when trend=UP: measure how far above support
+        adverseDistance := up - close  // Negative = above support (adverse)
+        adverseDistancePct := (math.abs(adverseDistance) / close) * 100
+        // Calculate change: positive = getting closer (improving), negative = getting further (worsening)
+        adverseDistanceChange := na(prevAdverseShortDistance) ? 0.0 : adverseDistance - prevAdverseShortDistance
+        // Classify severity based on percentage distance
+        adverseSeverity := adverseDistancePct < 0.5 ? "low" : adverseDistancePct < 1.0 ? "medium" : "high"
+    else if heldShortReleased
+        signalSource := "Held"
+        isAdverse := false
+
+//==============================
+// PLOT SUPERTREND
+//==============================
+
+upPlot = plot(trend == 1 ? up : na, title="Up Trend", style=plot.style_linebr, linewidth=2, color=color.green)
+dnPlot = plot(trend == 1 ? na : dn, title="Down Trend", style=plot.style_linebr, linewidth=2, color=color.red)
+
+// Fill Background
+mPlot          = plot(ohlc4, title="", style=plot.style_circles, linewidth=1)
+longFillColor  = highlighting ? (trend == 1 ? color.rgb(76, 175, 79, 95) : color.rgb(255, 255, 255, 99)) : color.rgb(255, 255, 255, 99)
+shortFillColor = highlighting ? (trend == -1 ? color.rgb(255, 82, 82, 95) : color.rgb(255, 255, 255, 99)) : color.rgb(255, 255, 255, 99)
+
+fill(mPlot, upPlot, title="UpTrend Highlighter", color=longFillColor)
+fill(mPlot, dnPlot, title="DownTrend Highlighter", color=shortFillColor)
+
+//==============================
+// PLOT EMAS
+//==============================
+
+plot(emaFast, "Fast EMA", color=color.new(color.white, 0), linewidth=1)
+plot(emaSlow, "Slow EMA", color=color.new(color.orange, 0), linewidth=1)
+
+//==============================
+// PLOT SIGNALS
+//==============================
+
+// Supertrend Only Signals (small circles)
+plotshape(supertrendBuy and showSupertrendSignals ? up : na,
+          title="Supertrend Buy",
+          location=location.absolute,
+          style=shape.circle,
+          size=size.tiny,
+          color=color.new(color.green, 50))
+
+plotshape(supertrendSell and showSupertrendSignals ? dn : na,
+          title="Supertrend Sell",
+          location=location.absolute,
+          style=shape.circle,
+          size=size.tiny,
+          color=color.new(color.red, 50))
+
+// Filtered EMA Signals (only when Supertrend agrees)
+plotshape(finalBuy and showFilteredSignals,
+          title="LONG",
+          text="Long",
+          location=location.belowbar,
+          style=shape.triangleup,
+          size=size.small,
+          color=color.new(color.green, 0),
+          textcolor=color.white)
+
+plotshape(finalSell and showFilteredSignals,
+          title="SHORT",
+          text="Short",
+          location=location.abovebar,
+          style=shape.triangledown,
+          size=size.small,
+          color=color.new(color.red, 0),
+          textcolor=color.white)
+
+//==============================
+// DEBUG: SIGNAL COUNTS
+//==============================
+
+var int countSupertrendBuy  = 0
+var int countSupertrendSell = 0
+var int countEmaCrossUp     = 0
+var int countEmaCrossDown   = 0
+var int countImmediateBuy   = 0
+var int countImmediateSell  = 0
+var int countHeldLong       = 0
+var int countHeldShort      = 0
+var int countFinalBuy       = 0
+var int countFinalSell      = 0
+var int countBlockedBySession = 0
+var int countDiLongRelease  = 0
+var int countDiShortRelease = 0
+
+// Reset all counters at start of new session
+if sessionStart_detected
+    countSupertrendBuy := 0
+    countSupertrendSell := 0
+    countEmaCrossUp := 0
+    countEmaCrossDown := 0
+    countImmediateBuy := 0
+    countImmediateSell := 0
+    countHeldLong := 0
+    countHeldShort := 0
+    countFinalBuy := 0
+    countFinalSell := 0
+    countBlockedBySession := 0
+    countDiLongRelease := 0
+    countDiShortRelease := 0
+
+// Only count signals that occur within the session
+if inSession or not enableSession
+    // Track signals blocked by session filter
+    if (immediateBuy or heldLongReleased or immediateSell or heldShortReleased) and not inSession
+        countBlockedBySession += 1
+
+    // Track signals blocked by fresh signal logic
+    if enableSession and inSession
+        if (immediateBuy or heldLongReleased) and not allowBuySignal
+            countBlockedBySession += 1
+        if (immediateSell or heldShortReleased) and not allowSellSignal
+            countBlockedBySession += 1
+
+if (inSession or not enableSession) and supertrendBuy
+    countSupertrendBuy += 1
+if (inSession or not enableSession) and supertrendSell
+    countSupertrendSell += 1
+if (inSession or not enableSession) and emaCrossUp
+    countEmaCrossUp += 1
+if (inSession or not enableSession) and emaCrossDown
+    countEmaCrossDown += 1
+if (inSession or not enableSession) and immediateBuy
+    countImmediateBuy += 1
+if (inSession or not enableSession) and immediateSell
+    countImmediateSell += 1
+if (inSession or not enableSession) and heldLongReleased
+    countHeldLong += 1
+if (inSession or not enableSession) and heldShortReleased
+    countHeldShort += 1
+if (inSession or not enableSession) and finalBuy
+    countFinalBuy += 1
+if (inSession or not enableSession) and finalSell
+    countFinalSell += 1
+
+// Track DI filter releases (when DI confirms but Supertrend doesn't)
+if (inSession or not enableSession) and emaCrossUp and trend != 1 and diLongConfirm
+    countDiLongRelease += 1
+if (inSession or not enableSession) and emaCrossDown and trend != -1 and diShortConfirm
+    countDiShortRelease += 1
+
+// Display counts in table
+if showDebugTable and barstate.islast
+    var table debugTable = table.new(position.top_right, 2, 15, bgcolor=color.new(color.black, 20), border_width=1)
+
+    // Headers
+    table.cell(debugTable, 0, 0, "Signal Type", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
+    table.cell(debugTable, 1, 0, "Count", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
+
+    // Supertrend signals
+    table.cell(debugTable, 0, 1, "Supertrend Buy", text_color=color.new(color.green, 0), text_size=size.small)
+    table.cell(debugTable, 1, 1, str.tostring(countSupertrendBuy), text_color=color.white, text_size=size.small)
+
+    table.cell(debugTable, 0, 2, "Supertrend Sell", text_color=color.new(color.red, 0), text_size=size.small)
+    table.cell(debugTable, 1, 2, str.tostring(countSupertrendSell), text_color=color.white, text_size=size.small)
+
+    // EMA crossover signals
+    table.cell(debugTable, 0, 3, "EMA Cross Up", text_color=color.new(color.aqua, 0), text_size=size.small)
+    table.cell(debugTable, 1, 3, str.tostring(countEmaCrossUp), text_color=color.white, text_size=size.small)
+
+    table.cell(debugTable, 0, 4, "EMA Cross Down", text_color=color.new(color.fuchsia, 0), text_size=size.small)
+    table.cell(debugTable, 1, 4, str.tostring(countEmaCrossDown), text_color=color.white, text_size=size.small)
+
+    // Immediate signals
+    table.cell(debugTable, 0, 5, "Immediate Buy", text_color=color.new(color.lime, 0), text_size=size.small)
+    table.cell(debugTable, 1, 5, str.tostring(countImmediateBuy), text_color=color.white, text_size=size.small)
+
+    table.cell(debugTable, 0, 6, "Immediate Sell", text_color=color.new(color.orange, 0), text_size=size.small)
+    table.cell(debugTable, 1, 6, str.tostring(countImmediateSell), text_color=color.white, text_size=size.small)
+
+    // Held signals
+    table.cell(debugTable, 0, 7, "Held Long Released", text_color=color.new(color.yellow, 0), text_size=size.small)
+    table.cell(debugTable, 1, 7, str.tostring(countHeldLong), text_color=color.white, text_size=size.small)
+
+    table.cell(debugTable, 0, 8, "Held Short Released", text_color=color.new(color.yellow, 0), text_size=size.small)
+    table.cell(debugTable, 1, 8, str.tostring(countHeldShort), text_color=color.white, text_size=size.small)
+
+    // DI filter releases
+    table.cell(debugTable, 0, 9, "DI Long Release", text_color=color.new(color.aqua, 0), text_size=size.small)
+    table.cell(debugTable, 1, 9, str.tostring(countDiLongRelease), text_color=color.white, text_size=size.small)
+
+    table.cell(debugTable, 0, 10, "DI Short Release", text_color=color.new(color.fuchsia, 0), text_size=size.small)
+    table.cell(debugTable, 1, 10, str.tostring(countDiShortRelease), text_color=color.white, text_size=size.small)
+
+    // Final signals
+    table.cell(debugTable, 0, 11, "FINAL BUY", text_color=color.new(color.green, 0), bgcolor=color.new(color.green, 80), text_size=size.small)
+    table.cell(debugTable, 1, 11, str.tostring(countFinalBuy), text_color=color.white, bgcolor=color.new(color.green, 80), text_size=size.small)
+
+    table.cell(debugTable, 0, 12, "FINAL SELL", text_color=color.new(color.red, 0), bgcolor=color.new(color.red, 80), text_size=size.small)
+    table.cell(debugTable, 1, 12, str.tostring(countFinalSell), text_color=color.white, bgcolor=color.new(color.red, 80), text_size=size.small)
+
+    // Session info
+    sessionStatusText = enableSession ? (inSession ? "In Session" : "Out of Session") : "Disabled"
+    sessionStatusColor = enableSession ? (inSession ? color.new(color.lime, 0) : color.new(color.gray, 0)) : color.new(color.gray, 0)
+    table.cell(debugTable, 0, 13, "Session Status", text_color=color.white, bgcolor=color.new(color.blue, 80), text_size=size.small)
+    table.cell(debugTable, 1, 13, sessionStatusText, text_color=sessionStatusColor, bgcolor=color.new(color.blue, 80), text_size=size.small)
+
+    table.cell(debugTable, 0, 14, "Blocked by Session", text_color=color.new(color.orange, 0), text_size=size.small)
+    table.cell(debugTable, 1, 14, str.tostring(countBlockedBySession), text_color=color.white, text_size=size.small)
+
+// Display real-time state debug table
+if showStateTable and barstate.islast
+    var table stateTable = table.new(position.bottom_right, 2, 18, bgcolor=color.new(color.black, 20), border_width=1)
+
+    // Headers
+    table.cell(stateTable, 0, 0, "Indicator State", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
+    table.cell(stateTable, 1, 0, "Value", text_color=color.white, bgcolor=color.new(color.gray, 50), text_size=size.small)
+
+    // Supertrend
+    trendText = trend == 1 ? "UP" : "DOWN"
+    trendColor = trend == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
+    table.cell(stateTable, 0, 1, "Supertrend", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 1, trendText, text_color=trendColor, text_size=size.small)
+
+    // EMA Relationship
+    emaText = emaFast > emaSlow ? "Fast > Slow" : "Fast < Slow"
+    emaColor = emaFast > emaSlow ? color.new(color.green, 0) : color.new(color.red, 0)
+    table.cell(stateTable, 0, 2, "EMA", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 2, emaText, text_color=emaColor, text_size=size.small)
+
+    // EMA Crossovers
+    table.cell(stateTable, 0, 3, "EMA Cross Up", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 3, emaCrossUp ? "YES" : "no", text_color=emaCrossUp ? color.new(color.lime, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    table.cell(stateTable, 0, 4, "EMA Cross Down", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 4, emaCrossDown ? "YES" : "no", text_color=emaCrossDown ? color.new(color.red, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    // DI values
+    table.cell(stateTable, 0, 5, "DI+ / DI-", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 5, str.tostring(math.round(plusDI, 1)) + " / " + str.tostring(math.round(minusDI, 1)), text_color=color.white, text_size=size.small)
+
+    // DI Crossovers
+    table.cell(stateTable, 0, 6, "DI Cross Up Recent", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 6, diCrossUpRecent ? "YES" : "no", text_color=diCrossUpRecent ? color.new(color.lime, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    table.cell(stateTable, 0, 7, "DI Cross Down Recent", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 7, diCrossDownRecent ? "YES" : "no", text_color=diCrossDownRecent ? color.new(color.red, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    // DI Confirmations
+    table.cell(stateTable, 0, 8, "DI Long Confirm", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 8, diLongConfirm ? "YES" : "no", text_color=diLongConfirm ? color.new(color.lime, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    table.cell(stateTable, 0, 9, "DI Short Confirm", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 9, diShortConfirm ? "YES" : "no", text_color=diShortConfirm ? color.new(color.red, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    // Pending signals
+    pendingLongText = not na(pendingLongBar) ? str.tostring(bar_index - pendingLongBar) + " bars" : "None"
+    table.cell(stateTable, 0, 10, "Pending Long", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 10, pendingLongText, text_color=not na(pendingLongBar) ? color.new(color.yellow, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    pendingShortText = not na(pendingShortBar) ? str.tostring(bar_index - pendingShortBar) + " bars" : "None"
+    table.cell(stateTable, 0, 11, "Pending Short", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 11, pendingShortText, text_color=not na(pendingShortBar) ? color.new(color.yellow, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    // Final signals
+    table.cell(stateTable, 0, 12, "Final BUY", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 12, finalBuy ? "FIRE!" : "no", text_color=finalBuy ? color.new(color.lime, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    table.cell(stateTable, 0, 13, "Final SELL", text_color=color.white, text_size=size.small)
+    table.cell(stateTable, 1, 13, finalSell ? "FIRE!" : "no", text_color=finalSell ? color.new(color.red, 0) : color.new(color.gray, 0), text_size=size.small)
+
+    // Adverse Distance Metrics (only show when adverse signal detected)
+    if isAdverse
+        table.cell(stateTable, 0, 14, "Adverse Distance", text_color=color.white, text_size=size.small)
+        table.cell(stateTable, 1, 14, str.tostring(math.round(adverseDistance, 2)), text_color=color.new(color.orange, 0), text_size=size.small)
+
+        table.cell(stateTable, 0, 15, "Adverse Dist %", text_color=color.white, text_size=size.small)
+        distColor = adverseDistancePct < 0.5 ? color.new(color.green, 0) : adverseDistancePct < 1.0 ? color.new(color.orange, 0) : color.new(color.red, 0)
+        table.cell(stateTable, 1, 15, str.tostring(math.round(adverseDistancePct, 2)) + "%", text_color=distColor, text_size=size.small)
+
+        table.cell(stateTable, 0, 16, "Distance Change", text_color=color.white, text_size=size.small)
+        // Positive change = getting closer to band (improving), negative = getting further (worsening)
+        changeText = adverseDistanceChange > 0 ? "Improving ▼" : adverseDistanceChange < 0 ? "Worsening ▲" : "Stable"
+        changeColor = adverseDistanceChange > 0 ? color.new(color.green, 0) : adverseDistanceChange < 0 ? color.new(color.red, 0) : color.new(color.gray, 0)
+        table.cell(stateTable, 1, 16, changeText, text_color=changeColor, text_size=size.small)
+
+        table.cell(stateTable, 0, 17, "Severity", text_color=color.white, text_size=size.small)
+        sevColor = adverseSeverity == "low" ? color.new(color.green, 0) : adverseSeverity == "medium" ? color.new(color.orange, 0) : color.new(color.red, 0)
+        table.cell(stateTable, 1, 17, adverseSeverity, text_color=sevColor, text_size=size.small)
+
+//==============================
+// ALERTS
+//==============================
+
+// Logging for signal events
+if emaCrossUp
+    log.info("EMA Cross Up | Trend: " + str.tostring(trend) + " | DI Long Confirm: " + str.tostring(diLongConfirm))
+
+if emaCrossDown
+    log.info("EMA Cross Down | Trend: " + str.tostring(trend) + " | DI Short Confirm: " + str.tostring(diShortConfirm))
+
+if immediateBuy and trend == 1
+    log.info("IMMEDIATE BUY - Supertrend Confirms | Price: " + str.tostring(close))
+
+if immediateBuy and trend != 1 and diLongConfirm
+    log.warning("IMMEDIATE BUY - DI Filter Bypass (ADVERSE) | Price: " + str.tostring(close) + " | Trend: DOWN")
+
+if not na(pendingLongBar) and bar_index == pendingLongBar
+    log.info("HOLDING LONG Signal | Will wait " + str.tostring(maxHoldBars) + " bars for trend flip")
+
+if heldLongReleased
+    log.info("HELD LONG RELEASED - Trend Flipped | Price: " + str.tostring(close))
+
+if immediateSell and trend == -1
+    log.info("IMMEDIATE SELL - Supertrend Confirms | Price: " + str.tostring(close))
+
+if immediateSell and trend != -1 and diShortConfirm
+    log.warning("IMMEDIATE SELL - DI Filter Bypass (ADVERSE) | Price: " + str.tostring(close) + " | Trend: UP")
+
+if not na(pendingShortBar) and bar_index == pendingShortBar
+    log.info("HOLDING SHORT Signal | Will wait " + str.tostring(maxHoldBars) + " bars for trend flip")
+
+if heldShortReleased
+    log.info("HELD SHORT RELEASED - Trend Flipped | Price: " + str.tostring(close))
+
+if sessionStart_detected
+    log.info("===== SESSION START ===== | Time: " + str.tostring(time))
+
+if sessionEnd_detected
+    log.info("===== SESSION END ===== | Time: " + str.tostring(time))
+
+// Log blocked signals
+if (immediateBuy or heldLongReleased) and not inSession
+    log.warning("LONG Signal BLOCKED - Outside Session | Price: " + str.tostring(close))
+
+if (immediateSell or heldShortReleased) and not inSession
+    log.warning("SHORT Signal BLOCKED - Outside Session | Price: " + str.tostring(close))
+
+if enableSession and inSession
+    if (immediateBuy or heldLongReleased) and not allowBuySignal
+        log.warning("LONG Signal BLOCKED - Not Fresh (stale from pre-session) | Price: " + str.tostring(close))
+    if (immediateSell or heldShortReleased) and not allowSellSignal
+        log.warning("SHORT Signal BLOCKED - Not Fresh (stale from pre-session) | Price: " + str.tostring(close))
+
+// Entry alert - LONG
+if finalBuy
+    log.info("🔥 FINAL BUY ALERT FIRED | Source: " + signalSource + " | Adverse: " + str.tostring(isAdverse) + " | Price: " + str.tostring(close))
+
+    // Build nested adverse object with formatted numbers
+    adverseObj = isAdverse ?
+                 '{"distance":' + str.tostring(math.round(adverseDistance, 4)) +
+                 ',"distance_pct":' + str.tostring(math.round(adverseDistancePct, 4)) +
+                 ',"distance_change":' + str.tostring(math.round(adverseDistanceChange, 4)) +
+                 ',"severity":"' + adverseSeverity + '"}' :
+                 'null'
+
+    alertMsg = '{"secret":"0I61QTI6NqrXi79r3CN"' +
+               ',"signal_id":"' + str.tostring(timenow) + '"' +
+               ',"symbol_tv":"' + syminfo.ticker + '"' +
+               ',"exchange":"' + syminfo.prefix + '"' +
+               ',"interval":"' + timeframe.period + '"' +
+               ',"bar_time":"' + str.tostring(time) + '"' +
+               ',"fire_time":"' + str.tostring(timenow) + '"' +
+               ',"action":"Long"' +
+               ',"action_type":"EMA-Open-Long"' +
+               ',"is_adverse":"' + str.tostring(isAdverse) + '"' +
+               ',"adverse":' + adverseObj +
+               ',"qty":"1"' +
+               ',"exec_price":"' + str.tostring(math.round(close, 2)) + '"' +
+               ',"pos_size":"1"' +
+               ',"order_id":"1"' +
+               ',"comment":"ST+EMA EMA:' + str.tostring(fastLen) + '/' + str.tostring(slowLen) + ' ST:' + str.tostring(atrPeriod) + '/' + str.tostring(multiplier) + ' DI:' + str.tostring(adxLength) + '"' +
+               ',"open":"' + str.tostring(math.round(open, 2)) + '"' +
+               ',"high":"' + str.tostring(math.round(high, 2)) + '"' +
+               ',"low":"' + str.tostring(math.round(low, 2)) + '"' +
+               ',"close":"' + str.tostring(math.round(close, 2)) + '"' +
+               ',"volume":"' + str.tostring(math.round(volume, 0)) + '"}'
+    alert(alertMsg, alert.freq_once_per_bar)
+
+// Entry alert - SHORT
+if finalSell
+    log.info("🔥 FINAL SELL ALERT FIRED | Source: " + signalSource + " | Adverse: " + str.tostring(isAdverse) + " | Price: " + str.tostring(close))
+
+    // Build nested adverse object with formatted numbers
+    adverseObj = isAdverse ?
+                 '{"distance":' + str.tostring(math.round(adverseDistance, 4)) +
+                 ',"distance_pct":' + str.tostring(math.round(adverseDistancePct, 4)) +
+                 ',"distance_change":' + str.tostring(math.round(adverseDistanceChange, 4)) +
+                 ',"severity":"' + adverseSeverity + '"}' :
+                 'null'
+
+    alertMsg = '{"secret":"0I61QTI6NqrXi79r3CN"' +
+               ',"signal_id":"' + str.tostring(timenow) + '"' +
+               ',"symbol_tv":"' + syminfo.ticker + '"' +
+               ',"exchange":"' + syminfo.prefix + '"' +
+               ',"interval":"' + timeframe.period + '"' +
+               ',"bar_time":"' + str.tostring(time) + '"' +
+               ',"fire_time":"' + str.tostring(timenow) + '"' +
+               ',"action":"Short"' +
+               ',"action_type":"EMA-Open-Short"' +
+               ',"is_adverse":"' + str.tostring(isAdverse) + '"' +
+               ',"adverse":' + adverseObj +
+               ',"qty":"1"' +
+               ',"exec_price":"' + str.tostring(math.round(close, 2)) + '"' +
+               ',"pos_size":"-1"' +
+               ',"order_id":"1"' +
+               ',"comment":"ST+EMA EMA:' + str.tostring(fastLen) + '/' + str.tostring(slowLen) + ' ST:' + str.tostring(atrPeriod) + '/' + str.tostring(multiplier) + ' DI:' + str.tostring(adxLength) + '"' +
+               ',"open":"' + str.tostring(math.round(open, 2)) + '"' +
+               ',"high":"' + str.tostring(math.round(high, 2)) + '"' +
+               ',"low":"' + str.tostring(math.round(low, 2)) + '"' +
+               ',"close":"' + str.tostring(math.round(close, 2)) + '"' +
+               ',"volume":"' + str.tostring(math.round(volume, 0)) + '"}'
+    alert(alertMsg, alert.freq_once_per_bar)
